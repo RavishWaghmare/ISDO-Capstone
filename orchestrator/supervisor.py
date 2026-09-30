@@ -1,16 +1,21 @@
 """
-ISDO Lab C6/C7 - LangGraph Orchestrator (Supervisor) with extended HITL gate
+ISDO Lab C6/C7/C8 - LangGraph Orchestrator (Supervisor) with extended HITL gate + A2A fallback
 Routes a ticket through the agents built in Labs C3-C5 as nodes of one StateGraph:
 
     triage -> resolution -> sla --(hitl_required)--> hitl -> communication -> END
                                  \\--(otherwise)-------------> communication -> END
+
+A2A (Lab C8): when ChromaDB confidence is LOW, resolution_node asks the Knowledge Specialist
+(a2a/knowledge_specialist.py on http://localhost:8001) via POST /tasks + GET /tasks/{id} and uses
+its resolution and confidence. If the specialist is down or fails, confidence stays LOW -> HITL.
 
 HITL triggers (Lab C7) - any one is enough, all that apply are shown to the approver:
     P1_SLA          P1 ticket whose SLA is CRITICAL or BREACHED
     LOW_CONFIDENCE  Resolution Agent confidence is LOW (any priority)
     ACCESS_GRANT    request_type is 'Access Grant' (security-sensitive, any priority)
 
-Run from the project root (start mcp_server/snow_shim.py and jira_shim.py first):
+Run from the project root. Start first: mcp_server/snow_shim.py, mcp_server/jira_shim.py and, for A2A,
+    uvicorn a2a.knowledge_specialist:app --port 8001      (from the PROJECT ROOT so it finds data/kb)
     python orchestrator/supervisor.py              # 4 test tickets: P2 VPN, P1 SAP, P3 Webex (LOW), access grant
     python orchestrator/supervisor.py --step3      # C7 Step 3 as written: VPN ticket rewritten as a Webex issue
 """
@@ -33,10 +38,16 @@ if hasattr(sys.stdout, "reconfigure"):
 from langgraph.graph import END, START, StateGraph
 
 from agents import triage_agent                                     # Lab C3 - classify_ticket tool + prompt
-from agents.resolution_agent import resolve_ticket                 # Lab C4 - ChromaDB RAG + confidence policy
+from agents import resolution_agent                                 # Lab C4 - ChromaDB RAG + confidence policy
+from agents.resolution_agent import resolve_ticket
 from agents.sla_agent import SLA_TARGET_MIN, get_sla_status, update_ticket   # Lab C5 - SLA rules + ServiceNow PATCH
 
 JIRA_URL = "http://localhost:5002/rest/api/2/issue"                 # Lab C2 Jira shim
+A2A_URL = "http://localhost:8001"                                   # Lab C8 Knowledge Specialist
+A2A_POST_TIMEOUT = 90     # POST /tasks runs a Claude call before it answers, so allow time
+A2A_GET_TIMEOUT = 10
+# Same auto-resolve rule as the C4 agent (never P1); read from it so the two can't drift apart
+AUTO_RESOLVE_PRIORITIES = getattr(resolution_agent, "AUTO_RESOLVE_PRIORITIES", {"P2", "P3", "P4"})
 REQUESTS_CSV = PROJECT_ROOT / "data" / "requests.csv"
 PRIORITY_RANK = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}
 ESCALATION_TEAM = {"Network": "L2-Network-Ops", "Application": "L2-App-Support", "Server": "L2-Server-Ops",
@@ -67,6 +78,8 @@ class TicketState(TypedDict, total=False):
     auto_resolve: bool
     confidence: str
     confidence_score: float
+    a2a_status: str               # "not needed" | "used" | "unavailable: <why>"  (Lab C8)
+    a2a_task_id: str
     # sla node
     sla_breach_risk: str
     sla_minutes_remaining: int
@@ -177,16 +190,68 @@ def triage_node(state: TicketState) -> dict:
 # ======================================================================
 # NODE 2 - RESOLUTION (Lab C4 agent: ChromaDB search + drafted steps)
 # ======================================================================
+def call_knowledge_specialist(state):
+    """A2A round trip: POST /tasks -> task_id, then GET /tasks/{task_id} -> result.
+    Returns (task_id, result, None) on success or (None, None, reason) on any failure."""
+    payload = {"query": f"{state['short_description']}. {state['description']}",
+               "ticket_number": state["ticket_number"],
+               "context": f"Category: {state['triage_category']}, Priority: {state['effective_priority']}"}
+    try:
+        post = requests.post(f"{A2A_URL}/tasks", json=payload, timeout=A2A_POST_TIMEOUT)
+        post.raise_for_status()
+        task_id = post.json()["task_id"]
+        print(f"  -> POST {A2A_URL}/tasks  task_id: {task_id}")
+        get = requests.get(f"{A2A_URL}/tasks/{task_id}", timeout=A2A_GET_TIMEOUT)
+        get.raise_for_status()
+        result = get.json()["result"]
+        print(f"  -> GET  {A2A_URL}/tasks/{task_id}")
+    except requests.exceptions.ConnectionError:
+        return None, None, f"A2A server not running at {A2A_URL}"
+    except requests.exceptions.Timeout:
+        return None, None, "A2A server timed out"
+    except (requests.RequestException, ValueError, KeyError) as e:    # HTTP error, bad JSON, missing field
+        return None, None, f"A2A call failed ({type(e).__name__}: {str(e)[:80]})"
+    if result.get("confidence") not in ("HIGH", "MEDIUM", "LOW") or not str(result.get("resolution", "")).strip():
+        return None, None, "A2A returned an incomplete result"
+    return task_id, result, None
+
+
 def resolution_node(state: TicketState) -> dict:
     print("\n▶ RESOLUTION AGENT - searching KB")
     r = run_quietly(resolve_ticket, state["ticket_number"], state["short_description"], state["description"],
                     state["triage_category"], state["effective_priority"])
     print(f"  KB Article: {r['kb_article_used']}")
     print(f"  Confidence: {r['confidence']} ({r['top_score']:.0%}) | Auto-resolve: {r['auto_resolve']}")
-    return {"kb_article": r["kb_article_used"], "resolution_text": r["resolution_text"],
-            "auto_resolve": r["auto_resolve"], "confidence": r["confidence"], "confidence_score": r["top_score"],
-            "audit_log": audit("ResolutionAgent", "search_kb",
-                               f"{r['kb_article_used']} {r['confidence']} ({r['top_score']:.0%}) auto_resolve={r['auto_resolve']}")}
+    out = {"kb_article": r["kb_article_used"], "resolution_text": r["resolution_text"],
+           "auto_resolve": r["auto_resolve"], "confidence": r["confidence"], "confidence_score": r["top_score"],
+           "a2a_status": "not needed",
+           "audit_log": audit("ResolutionAgent", "search_kb",
+                              f"{r['kb_article_used']} {r['confidence']} ({r['top_score']:.0%}) auto_resolve={r['auto_resolve']}")}
+    if r["confidence"] != "LOW":
+        return out
+
+    # -- Lab C8: LOW confidence -> ask the Knowledge Specialist over A2A --------------
+    print("  -> Confidence LOW - calling A2A Knowledge Specialist")
+    task_id, a2a, error = call_knowledge_specialist(state)
+    if error:   # server down / failed: keep LOW, which makes sla_node route the ticket to HITL
+        print(f"  !! {error} - keeping LOW confidence; HITL will handle this ticket")
+        out["a2a_status"] = f"unavailable: {error}"
+        out["audit_log"] += audit("ResolutionAgent", "a2a_knowledge_specialist", f"FAILED - {error} - kept LOW")
+        return out
+
+    confidence = a2a["confidence"]
+    # Same guardrail as C4: auto-resolve only on HIGH, never for P1, and not if the specialist says escalate.
+    auto = (confidence == "HIGH" and state["effective_priority"] in AUTO_RESOLVE_PRIORITIES
+            and not a2a.get("escalate_to_l2", False))
+    print(f"  A2A RESULT: best match {a2a.get('best_match')} | {confidence} ({a2a.get('confidence_score', 0):.0%})"
+          f" | escalate_to_l2={a2a.get('escalate_to_l2')} | Auto-resolve: {auto}")
+    out.update({"kb_article": a2a.get("best_match") or r["kb_article_used"], "resolution_text": a2a["resolution"],
+                "confidence": confidence, "confidence_score": float(a2a.get("confidence_score", 0) or 0),
+                "auto_resolve": auto, "a2a_status": "used", "a2a_task_id": task_id})
+    out["audit_log"] += audit("ResolutionAgent", "a2a_knowledge_specialist",
+                              f"task {task_id}: {a2a.get('best_match')} {confidence} "
+                              f"({out['confidence_score']:.0%}) auto_resolve={auto}")
+    return out
 
 # ======================================================================
 # NODE 3 - SLA + HITL TRIGGER EVALUATION (deterministic - no LLM)
@@ -204,7 +269,11 @@ def sla_node(state: TicketState) -> dict:
         reasons.append(f"P1 SLA {sla['breach_risk']} ({sla['minutes_remaining']} min) - escalation to {team_for(state)}")
     if state.get("confidence") == "LOW":
         triggers.append("LOW_CONFIDENCE")
-        reasons.append(f"LOW KB confidence ({state.get('confidence_score', 0):.0%}) - no clear fix, route to L2")
+        a2a = state.get("a2a_status", "not needed")
+        note = ("Knowledge Specialist also LOW" if a2a == "used"
+                else a2a.replace("unavailable: ", "") if a2a.startswith("unavailable") else "")
+        reasons.append(f"LOW KB confidence ({state.get('confidence_score', 0):.0%})"
+                       + (f" - {note}" if note else "") + " - no clear fix, route to L2")
     # Lab brief: category 'Access' + request_type 'Access Grant'. The request_type alone is what makes it
     # security-sensitive, so a grant that triage files under another category still cannot skip approval.
     if request_type == "Access Grant":
